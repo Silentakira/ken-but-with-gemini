@@ -532,17 +532,19 @@ fn setup_window_for_fullscreen_overlay<R: Runtime>(window: &tauri::WebviewWindow
 
         let ns_window = ns_window as *mut Object;
 
-        // Use kCGOverlayWindowLevel (1024) to appear above fullscreen apps
-        let _: () = msg_send![ns_window, setLevel: 1024i64];
-        klog!("setup_window_for_fullscreen_overlay: Set level to 1024");
+        // Use kCGScreenSaverWindowLevel (1000) - even higher than overlay level
+        // This level is specifically designed to appear above fullscreen apps
+        let _: () = msg_send![ns_window, setLevel: 1000i64];
+        klog!("setup_window_for_fullscreen_overlay: Set level to 1000 (kCGScreenSaverWindowLevel)");
+
+        // Make window behave like a panel (non-activating)
+        let _: () = msg_send![ns_window, setWorksWhenModal: 1u8];
+        let _: () = msg_send![ns_window, setBecomesKeyOnlyIfNeeded: 1u8];
+        let _: () = msg_send![ns_window, setHidesOnDeactivate: 0u8];
 
         // NSWindowCollectionBehavior flags for fullscreen overlay
         let _: () = msg_send![ns_window, setCollectionBehavior: 337u64];
         klog!("setup_window_for_fullscreen_overlay: Set collectionBehavior to 337");
-
-        // Prevent hiding/deactivation
-        let _: () = msg_send![ns_window, setHidesOnDeactivate: 0u8];
-        let _: () = msg_send![ns_window, setCanHide: 0u8];
 
         klog!("setup_window_for_fullscreen_overlay: Setup complete");
     }
