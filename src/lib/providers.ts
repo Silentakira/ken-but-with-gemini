@@ -260,6 +260,20 @@ export const MODEL_OPTIONS: ModelOption[] = [
     group: "DeepSeek",
   },
   {
+    id: "google/gemini-3.1-flash-lite",
+    label: "Gemini 3.1 Flash Lite (GA)",
+    provider: "google",
+    providerLabel: "Google Gemini",
+    group: "Google Gemini",
+  },
+  {
+    id: "google/gemini-3-flash-preview",
+    label: "Gemini 3 Flash Preview",
+    provider: "google",
+    providerLabel: "Google Gemini",
+    group: "Google Gemini",
+  },
+  {
     id: "google/gemini-2.5-pro",
     label: "Gemini 2.5 Pro",
     provider: "google",
@@ -383,7 +397,7 @@ export const MODEL_OPTIONS: ModelOption[] = [
 export const DEFAULT_HOTKEY: HotkeySpec = { kind: "double-tap", key: "alt" };
 
 export const DEFAULT_SETTINGS: ProviderSettings = {
-  providerModel: "openai-codex/gpt-5.5",
+  providerModel: "google/gemini-3.1-flash-lite",
   openaiApiKey: "",
   zaiApiKey: "",
   openrouterApiKey: "",
@@ -662,10 +676,11 @@ export async function askProvider({
     case "zai-coding":
     case "openrouter":
     case "deepseek":
-    case "google":
     case "groq":
     case "mistral":
       return askOpenAICompat(trimmed, settings, resolved.provider, resolved.model, history, images, signal);
+    case "google":
+      return askGeminiNative(trimmed, settings, resolved.model, history, images, signal);
     case "mock":
     default:
       return askMock(trimmed, settings.webSearch, history);
@@ -756,6 +771,173 @@ async function askOpenAI(
     providerLabel: "OpenAI API",
     modelLabel: model,
   };
+}
+
+/**
+ * Native Google Gemini API caller using Gemini's native format.
+ *
+ * This uses Gemini's REST API directly instead of the OpenAI-compatible shim.
+ * Supports streaming responses and multi-turn conversations with history.
+ */
+async function askGeminiNative(
+  query: string,
+  settings: ProviderSettings,
+  model: string,
+  history: ConversationTurn[],
+  images: ImageAttachment[],
+  signal?: AbortSignal,
+): Promise<AiResult> {
+  const apiKey = settings.googleApiKey.trim();
+  if (!apiKey) {
+    return {
+      text: "Add a Gemini API key in settings, or pick another model.",
+      providerLabel: "Google Gemini",
+      modelLabel: model,
+    };
+  }
+
+  // Map model names to Gemini model IDs
+  const modelNameMap: Record<string, string> = {
+    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite", // Fully GA, stable
+    "gemini-3-flash-preview": "gemini-3-flash-preview", // Preview access
+    "gemini-3-pro": "gemini-3-flash-preview", // Use preview for pro
+    "gemini-3-flash": "gemini-3-flash-preview", // Use preview for flash
+    "gemini-2.5-pro": "gemini-2.5-pro", // Keep as fallback
+    "gemini-2.5-flash": "gemini-2.0-flash", // Keep as fallback
+  };
+
+  const geminiModel = modelNameMap[model] || "gemini-3.1-flash-lite";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:streamGenerateContent?key=${apiKey}&alt=sse`;
+
+  // Build Gemini's contents array from conversation history
+  const contents: Array<{ role: string; parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> }> = [];
+
+  // Add history if present
+  for (const turn of history) {
+    const role = turn.role === "user" ? "user" : "model";
+    contents.push({
+      role,
+      parts: [{ text: turn.content }],
+    });
+  }
+
+  // Build current user message
+  const userParts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [];
+
+  // Add images first (Gemini puts images before text)
+  for (const image of images) {
+    userParts.push({
+      inline_data: {
+        mime_type: image.mimeType,
+        data: image.base64,
+      },
+    });
+  }
+
+  // Add text query
+  userParts.push({
+    text: query || "Describe the attached image.",
+  });
+
+  // Add current user message
+  contents.push({
+    role: "user",
+    parts: userParts,
+  });
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents,
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 8192,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      try {
+        const errorJson = JSON.parse(errorText);
+        return {
+          text: errorJson.error?.message || `${response.status} ${response.statusText}`,
+          providerLabel: "Google Gemini",
+          modelLabel: model,
+        };
+      } catch {
+        return {
+          text: `${response.status} ${response.statusText}`,
+          providerLabel: "Google Gemini",
+          modelLabel: model,
+        };
+      }
+    }
+
+    // Parse SSE streaming response
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return {
+        text: "No response stream received.",
+        providerLabel: "Google Gemini",
+        modelLabel: model,
+      };
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim() || !line.startsWith("data: ")) continue;
+
+        try {
+          const jsonStr = line.slice(6); // Remove "data: " prefix
+          const data = JSON.parse(jsonStr);
+
+          // Extract text from Gemini's response format
+          const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (typeof text === "string") {
+            fullText += text;
+          }
+        } catch {
+          // Skip invalid JSON lines
+        }
+      }
+    }
+
+    return {
+      text: fullText.trim() || "No response.",
+      providerLabel: "Google Gemini",
+      modelLabel: model,
+    };
+  } catch (caught) {
+    if ((caught as Error)?.name === "AbortError") {
+      return {
+        text: "Request canceled.",
+        providerLabel: "Google Gemini",
+        modelLabel: model,
+      };
+    }
+    return {
+      text: String(caught),
+      providerLabel: "Google Gemini",
+      modelLabel: model,
+    };
+  }
 }
 
 /**

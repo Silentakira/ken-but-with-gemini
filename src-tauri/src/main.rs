@@ -514,6 +514,40 @@ fn unique_image_name(dir: &Path, slug: &str, timestamp: u64, index: usize) -> St
     candidate
 }
 
+#[cfg(target_os = "macos")]
+fn setup_window_for_fullscreen_overlay<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+
+    let ns_window = match window.ns_window() {
+        Ok(w) => w,
+        Err(_) => {
+            klog!("setup_window_for_fullscreen_overlay: Failed to get ns_window");
+            return;
+        }
+    };
+
+    unsafe {
+        klog!("setup_window_for_fullscreen_overlay: Starting setup");
+
+        let ns_window = ns_window as *mut Object;
+
+        // Use kCGOverlayWindowLevel (1024) to appear above fullscreen apps
+        let _: () = msg_send![ns_window, setLevel: 1024i64];
+        klog!("setup_window_for_fullscreen_overlay: Set level to 1024");
+
+        // NSWindowCollectionBehavior flags for fullscreen overlay
+        let _: () = msg_send![ns_window, setCollectionBehavior: 337u64];
+        klog!("setup_window_for_fullscreen_overlay: Set collectionBehavior to 337");
+
+        // Prevent hiding/deactivation
+        let _: () = msg_send![ns_window, setHidesOnDeactivate: 0u8];
+        let _: () = msg_send![ns_window, setCanHide: 0u8];
+
+        klog!("setup_window_for_fullscreen_overlay: Setup complete");
+    }
+}
+
 fn show_palette<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         LAST_SHOW_MS.store(now_ms(), Ordering::Relaxed);
@@ -521,6 +555,13 @@ fn show_palette<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.show();
         let _ = window.set_focus();
         let _ = window.emit("palette-opened", ());
+
+        #[cfg(target_os = "macos")]
+        {
+            // Setup window for fullscreen overlay every time it's shown
+            setup_window_for_fullscreen_overlay(&window);
+        }
+
         klog!("show_palette");
     }
 }
@@ -529,6 +570,12 @@ fn hide_palette_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+
+    // Hide the screenshot capture overlay
+    if let Some(overlay) = app.get_webview_window("capture-overlay") {
+        let _ = overlay.hide();
+    }
+
     let _ = app;
     klog!("hide_palette");
 }
@@ -918,6 +965,104 @@ fn start_hotkey_listener(app: AppHandle, hotkey: HotkeyState) {
 #[cfg(not(target_os = "macos"))]
 fn start_hotkey_listener(_app: AppHandle, _hotkey: HotkeyState) {}
 
+/// Capture current screen automatically when Ken opens
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn capture_current_screen(window: tauri::Window) -> Result<String, String> {
+    use core_graphics::display::CGDisplay;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use base64::{engine::general_purpose, Engine as _};
+    use std::io::Cursor;
+
+    // Get the window's current position to find which monitor it's on
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+
+    // Find the display that contains the window's position
+    let displays = CGDisplay::active_displays().map_err(|e| e.to_string())?;
+    let target_display = displays.iter()
+        .find(|display_id| {
+            let display = CGDisplay::new(**display_id);
+            let bounds = display.bounds();
+            (position.x as f64) >= bounds.origin.x &&
+            (position.x as f64) < bounds.origin.x + bounds.size.width &&
+            (position.y as f64) >= bounds.origin.y &&
+            (position.y as f64) < bounds.origin.y + bounds.size.height
+        })
+        .map(|id| CGDisplay::new(*id))
+        .unwrap_or_else(CGDisplay::main);
+
+    let bounds = target_display.bounds();
+
+    let rect = CGRect {
+        origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y },
+        size: CGSize { width: bounds.size.width, height: bounds.size.height },
+    };
+
+    let image = CGDisplay::screenshot(
+        rect,
+        core_graphics::display::kCGWindowListOptionOnScreenOnly,
+        core_graphics::display::kCGNullWindowID,
+        core_graphics::display::kCGWindowImageDefault,
+    )
+    .ok_or("Screenshot failed — Screen Recording permission may not be granted")?;
+
+    // Convert to PNG bytes in memory, never touch disk
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let raw = image.data();
+    let bytes = raw.bytes();
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut cursor = Cursor::new(&mut png_bytes);
+
+        // Encode the raw RGBA data as PNG
+        let mut encoder = png::Encoder::new(&mut cursor, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+
+        let mut writer = encoder.write_header()
+            .map_err(|e| format!("PNG encoder error: {}", e))?;
+
+        writer.write_image_data(bytes)
+            .map_err(|e| format!("PNG write error: {}", e))?;
+    }
+
+    let base64_string = general_purpose::STANDARD.encode(&png_bytes);
+    Ok(base64_string)
+}
+
+/// Check screen recording permission status
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn check_screen_recording_permission() -> bool {
+    // On macOS, we can't reliably check screen recording permission upfront
+    // The capture_current_screen function will handle permission errors
+    true
+}
+
+/// Request screen recording permission (opens system prompt) - no-op on macOS
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn request_screen_recording_permission() {
+    // macOS doesn't provide a programmatic way to request screen recording permission
+    // Users must manually enable it in System Settings
+}
+
+/// Check screen recording permission status (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn check_screen_recording_permission() -> bool {
+    true
+}
+
+/// Request screen recording permission (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn request_screen_recording_permission() {
+    // No-op on non-macOS platforms
+}
+
 #[cfg(target_os = "macos")]
 fn start_proofread_capture(app: &AppHandle) {
     // Don't show the palette — proofread runs invisibly. Send Cmd+C to copy
@@ -988,6 +1133,21 @@ fn set_tray_status(status: String, app: AppHandle) -> Result<(), String> {
     tray.set_title(label.as_deref())
         .map_err(|error| format!("could not update tray title: {error}"))?;
     Ok(())
+}
+
+/// Check if screen capture permission is granted (macOS)
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn screen_capture_status() -> bool {
+    // We can't reliably check screen recording permission upfront
+    // The capture_current_screen function will handle permission errors
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn screen_capture_status() -> bool {
+    true // Assume permission on other platforms
 }
 
 /// Set the clipboard to `text` and synthesise Cmd+V so the selection is
@@ -1088,6 +1248,12 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
                 let _ = window.set_shadow(false);
+
+                #[cfg(target_os = "macos")]
+                {
+                    // Setup window for fullscreen overlay on startup
+                    setup_window_for_fullscreen_overlay(&window);
+                }
             }
 
             build_tray(app.handle())?;
@@ -1104,19 +1270,26 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(focused) = event {
+            if let tauri::WindowEvent::Focused(true) = event {
                 let now = now_ms();
                 let since_show = now.saturating_sub(LAST_SHOW_MS.load(Ordering::Relaxed));
                 let focus_is_held = now <= HOLD_FOCUS_UNTIL_MS.load(Ordering::Relaxed);
-                klog!("focused={} since_show={}ms", focused, since_show);
-                if !focused && since_show > FOCUS_GRACE_MS && !focus_is_held {
-                    hide_palette_window(&window.app_handle().clone());
+                klog!("focused=true since_show={}ms", since_show);
+
+                #[cfg(target_os = "macos")]
+                {
+                    // Reapply fullscreen overlay settings when window gains focus
+                    // macOS resets collection behavior when window is hidden/reshown
+                    if let Some(webview_window) = window.get_webview_window("main") {
+                        setup_window_for_fullscreen_overlay(&webview_window);
+                    }
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             accessibility_status,
             begin_file_picker,
+            capture_current_screen,
             copy_image_to_downloads,
             finish_file_picker,
             hide_palette,
@@ -1128,6 +1301,7 @@ fn main() {
             paste_text,
             reveal_in_file_manager,
             save_generated_images,
+            screen_capture_status,
             set_hotkey,
             set_palette_expanded,
             set_proofread_hotkey,
@@ -1144,6 +1318,8 @@ fn main() {
             ollama::open_ollama_models_folder,
             ollama::pull_ollama_model,
             search::search_web,
+            check_screen_recording_permission,
+            request_screen_recording_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KEN");

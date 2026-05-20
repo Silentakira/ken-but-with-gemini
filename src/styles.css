@@ -272,6 +272,56 @@ button {
   display: none;
 }
 
+.screenshot-preview {
+  display: flex;
+  justify-content: center;
+  max-width: min(760px, calc(100vw - 24px));
+  margin: 8px 14px 0;
+  padding: 0 2px;
+}
+
+.screenshot-chip {
+  display: flex;
+  position: relative;
+  max-width: 200px;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.12) inset;
+}
+
+.screenshot-chip img {
+  width: 100%;
+  height: auto;
+  max-width: 200px;
+  border-radius: 12px;
+  display: block;
+}
+
+.screenshot-chip button {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(10, 11, 12, 0.85);
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+  color: rgba(245, 240, 231, 0.9);
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.screenshot-chip button:hover {
+  background: rgba(20, 22, 25, 0.95);
+  color: rgba(255, 255, 255, 0.95);
+}
+
 .attachment-chip {
   display: grid;
   grid-template-columns: 36px minmax(56px, 128px) 24px;
@@ -740,6 +790,7 @@ button {
 }
 
 .result h1 {
+  /* Question display moved to turn-question component */
   margin: 12px 0 10px;
   color: #fffaf0;
   font-size: 18px;
@@ -864,6 +915,55 @@ button {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 16px;
+}
+
+.conversation-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.conversation-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+}
+
+.turn-question {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.turn-label {
+  color: rgba(245, 240, 231, 0.5);
+  font-size: 11px;
+  font-weight: 640;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+}
+
+.turn-text {
+  color: rgba(245, 240, 231, 0.7);
+  font-size: 13px;
+  font-weight: 500;
+  flex: 1;
+}
+
+.turn-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 4px;
+}
+
+.turn-divider {
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgba(245, 240, 231, 0.12), transparent);
+  margin: 8px 0;
 }
 
 .chip {

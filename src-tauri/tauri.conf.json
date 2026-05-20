@@ -25,7 +25,8 @@
         "transparent": true,
         "shadow": false,
         "alwaysOnTop": true,
-        "skipTaskbar": true
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {
@@ -49,7 +50,25 @@
     "macOS": {
       "minimumSystemVersion": "10.15",
       "hardenedRuntime": false,
-      "signingIdentity": "Apple Development: Carlos Domingues (D7ZJW65866)"
+      "signingIdentity": null,
+      "dmg": {
+        "windowPosition": {
+          "x": 400,
+          "y": 300
+        },
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
     }
   }
 }

@@ -97,6 +97,9 @@ export default function App() {
   const browserPullAbortRef = useRef<AbortController | null>(null);
   const [query, setQuery] = useState("");
   const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const [pendingScreenshot, setPendingScreenshot] = useState<string | null>(null);
+  const [autoScreenshot, setAutoScreenshot] = useState<string | null>(null);
+  const [screenRecordingDenied, setScreenRecordingDenied] = useState(false);
   const [settings, setSettings] = useState<ProviderSettings>(() => loadSettings());
   const [entries, setEntries] = useState<Entry[]>(() => loadHistory());
   const [isLoading, setIsLoading] = useState(false);
@@ -327,18 +330,39 @@ export default function App() {
   useEffect(() => {
     if (!window.__TAURI_INTERNALS__) return;
 
-    const unlisten = listen("palette-opened", () => {
+    const unlisten = listen("palette-opened", async () => {
       window.setTimeout(() => inputRef.current?.focus(), 40);
-      Promise.all([
+
+      // Check permissions
+      const [accessibility, inputMonitoring, screenRecording] = await Promise.all([
         invoke<boolean>("accessibility_status").catch(() => true),
         invoke<boolean>("input_monitoring_status").catch(() => true),
-      ]).then(([accessibility, inputMonitoring]) => {
-        setAccessibilityGranted(Boolean(accessibility));
-        setInputMonitoringGranted(Boolean(inputMonitoring));
-        if (!accessibility || !inputMonitoring) {
-          setShowSettings(true);
+        invoke<boolean>("check_screen_recording_permission").catch(() => false),
+      ]);
+
+      setAccessibilityGranted(Boolean(accessibility));
+      setInputMonitoringGranted(Boolean(inputMonitoring));
+
+      // Show screen recording banner if denied (only once)
+      if (!screenRecording) {
+        const dismissed = localStorage.getItem("screen-recording-banner-dismissed");
+        if (!dismissed) {
+          setScreenRecordingDenied(true);
         }
-      });
+      }
+
+      if (!accessibility || !inputMonitoring) {
+        setShowSettings(true);
+      }
+
+      // Capture automatic screenshot
+      try {
+        const screenshot = await invoke<string>("capture_current_screen");
+        setAutoScreenshot(screenshot);
+      } catch (e) {
+        // Screen recording not permitted, silently skip
+        setAutoScreenshot(null);
+      }
     });
 
     return () => {
@@ -376,6 +400,7 @@ export default function App() {
         if (activeThreadId) {
           setActiveThreadId(null);
           setQuery("");
+          setPendingScreenshot(null);
           return;
         }
         hidePalette();
@@ -412,8 +437,12 @@ export default function App() {
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     const trimmed = query.trim();
-    const submittedQuery = trimmed || (attachments.length ? "Describe the attached image." : "");
-    if ((!submittedQuery && attachments.length === 0) || isLoading) return;
+    const displayQuery = trimmed || (attachments.length ? "Describe the attached image." : "");
+    if ((!displayQuery && attachments.length === 0) || isLoading) return;
+
+    // Prepare query for API (with system instructions)
+    let apiQuery = displayQuery;
+    apiQuery = `Answer directly and concisely. Avoid unnecessary fluff, pleasantries, or over-explaining. Get straight to the point.\n\n${apiQuery}`;
 
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -430,22 +459,46 @@ export default function App() {
             { role: "assistant" as const, content: entry.result.text },
           ])
       : [];
-    const submittedImages = attachments;
+
+    // For new threads, include autoScreenshot silently
+    const submittedImages = [...attachments];
+    if (!activeThreadId && autoScreenshot) {
+      const dataUrl = `data:image/png;base64,${autoScreenshot}`;
+      submittedImages.push({
+        id: crypto.randomUUID(),
+        name: "screen.png",
+        mimeType: "image/png",
+        dataUrl,
+        base64: autoScreenshot,
+      });
+      // Add instruction to only reference screen when relevant
+      apiQuery = `(Context: A screenshot of my current screen is attached for context only. Only mention or describe what you see on screen if I explicitly ask about it or if it's directly relevant to answering my question.\n\n${apiQuery})`;
+    }
+
+    // Add pending screenshot to images if available (manual attachment)
+    if (pendingScreenshot) {
+      submittedImages.push({
+        id: crypto.randomUUID(),
+        name: "screenshot.png",
+        mimeType: "image/png",
+        dataUrl: pendingScreenshot,
+      });
+    }
 
     try {
       const result = await askProvider({
-        query: submittedQuery,
+        query: apiQuery,
         settings,
         signal: controller.signal,
         history,
         images: submittedImages,
       });
-      const persistedResult = await persistGeneratedImages(result, submittedQuery);
+      const persistedResult = await persistGeneratedImages(result, displayQuery);
       setEntries((current) => [
         {
           id: crypto.randomUUID(),
           threadId,
-          query: submittedQuery,
+          query: displayQuery, // Store only the user's actual query
           result: persistedResult,
           createdAt: new Date().toLocaleTimeString([], {
             hour: "2-digit",
@@ -458,6 +511,7 @@ export default function App() {
       setShowAllInlineHistory(false);
       setQuery("");
       setAttachments([]);
+      setPendingScreenshot(null);
     } catch (caught) {
       if ((caught as Error)?.name !== "AbortError") {
         setError(errorMessage(caught));
@@ -478,6 +532,8 @@ export default function App() {
     setActiveThreadId(null);
     setQuery("");
     setError("");
+    setPendingScreenshot(null);
+    setAutoScreenshot(null); // Clear auto screenshot for new thread
   }
 
   function flashImageAction(key: string, text: string) {
@@ -850,6 +906,30 @@ export default function App() {
     setAttachments((current) => current.filter((attachment) => attachment.id !== id));
   }
 
+  // Handle clicking outside the palette to close it
+  useEffect(() => {
+    if (!window.__TAURI_INTERNALS__) return;
+
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      const palette = document.querySelector('.palette');
+      const settingsPanel = document.querySelector('.settings-panel');
+      if (palette && !palette.contains(target) && (!settingsPanel || !settingsPanel.contains(target))) {
+        invoke("hide_palette").catch(() => undefined);
+      }
+    };
+
+    // Add event listener with a small delay to avoid immediate closing
+    const timer = setTimeout(() => {
+      document.addEventListener('mousedown', handleClickOutside);
+    }, 100);
+
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
   return (
     <main className="shell">
       <section className={`palette ${isExpanded ? "is-expanded" : "is-collapsed"}`} aria-label="KEN search">
@@ -984,6 +1064,62 @@ export default function App() {
             </button>
           </div>
         </form>
+
+        {screenRecordingDenied && (
+          <div className="permission-banner" style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            padding: '8px 12px',
+            margin: '8px 0',
+            background: 'rgba(255, 200, 0, 0.1)',
+            border: '1px solid rgba(255, 200, 0, 0.3)',
+            borderRadius: '6px',
+            fontSize: '13px'
+          }}>
+            <span style={{ flex: 1 }}>Enable Screen Recording in System Settings for screen context</span>
+            <button
+              type="button"
+              className="chip chip--primary"
+              onClick={() => {
+                window.open("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
+                localStorage.setItem("screen-recording-banner-dismissed", "true");
+                setScreenRecordingDenied(false);
+              }}
+            >
+              <ExternalLink size={14} aria-hidden="true" />
+              <span>Open Settings</span>
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => {
+                localStorage.setItem("screen-recording-banner-dismissed", "true");
+                setScreenRecordingDenied(false);
+              }}
+              aria-label="Dismiss"
+              title="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
+
+        {pendingScreenshot && (
+          <div className="screenshot-preview" aria-label="Screenshot preview">
+            <figure className="screenshot-chip">
+              <img src={pendingScreenshot} alt="Screenshot capture" />
+              <button
+                type="button"
+                onClick={() => setPendingScreenshot(null)}
+                aria-label="Remove screenshot"
+                title="Remove screenshot"
+              >
+                <X size={14} />
+              </button>
+            </figure>
+          </div>
+        )}
 
         {attachments.length > 0 && (
           <div className="attachments-bar" aria-label="Attached images">
@@ -1529,9 +1665,9 @@ export default function App() {
 
             {error && <p className="error">{error}</p>}
 
-            {(isLoading || latestEntry) && (
+            {(isLoading || threadEntries.length > 0) && (
               <section className="answer" aria-live="polite">
-                {isLoading ? (
+                {isLoading && threadEntries.length === 0 ? (
                   <article className="thinking">
                     <div>
                       <LoaderCircle size={18} />
@@ -1543,93 +1679,103 @@ export default function App() {
                       <i />
                     </div>
                   </article>
-                ) : latestEntry ? (
+                ) : (
                   <article className="result">
                     <div className="result-meta">
                       <span>
-                        {latestEntry.result.providerLabel} · {latestEntry.result.modelLabel}
-                        {isFollowUp && threadEntries.length > 1
-                          ? ` · ${threadEntries.length} turns`
-                          : ""}
+                        {threadEntries[0]?.result.providerLabel || activeModel.providerLabel} · {threadEntries[0]?.result.modelLabel || activeModel.label}
+                        {threadEntries.length > 1 ? ` · ${threadEntries.length} turns` : ""}
                       </span>
-                      <span>{latestEntry.createdAt}</span>
+                      <span>{threadEntries[threadEntries.length - 1]?.createdAt || ""}</span>
                     </div>
-                    <h1>{latestEntry.query}</h1>
-                    {latestEntry.result.text && (
-                      <div className="markdown">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {latestEntry.result.text}
-                        </ReactMarkdown>
-                      </div>
-                    )}
-                    {getDisplayImages(latestEntry.result).length > 0 && (
-                      <div className="images">
-                        {getDisplayImages(latestEntry.result).map((image, i) => {
-                          const key = `${image.href}-${i}`;
-                          const message = imageActionMessage?.key === key ? imageActionMessage.text : null;
-                          return (
-                            <figure className="image-card" key={key}>
-                              <a
-                                className="image-preview"
-                                href={image.href}
-                                target="_blank"
-                                rel="noreferrer"
-                                title={image.title}
-                              >
-                                <img src={image.src} alt="" />
-                              </a>
-                              <figcaption>
-                                <span title={image.path ?? image.fileName}>
-                                  {message ?? image.fileName}
-                                </span>
-                                <span className="image-actions">
-                                  {Boolean(image.path && window.__TAURI_INTERNALS__) && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleRevealImage(image, key)}
-                                      title="Show in Finder/Explorer"
-                                    >
-                                      <FolderOpen size={13} aria-hidden="true" />
-                                      <span>Show</span>
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleDownloadImage(image, key)}
-                                    title="Save a copy to Downloads"
-                                  >
-                                    <Download size={13} aria-hidden="true" />
-                                    <span>Download</span>
-                                  </button>
-                                </span>
-                              </figcaption>
-                            </figure>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {latestEntry.result.sources && latestEntry.result.sources.length > 0 && (
-                      <div className="sources">
-                        {latestEntry.result.sources.map((source) => (
-                          <a href={source.url} key={source.url} target="_blank" rel="noreferrer">
-                            {source.title}
-                          </a>
-                        ))}
-                      </div>
-                    )}
+                    <div className="conversation-thread">
+                      {threadEntries.map((entry, index) => (
+                        <div key={entry.id} className="conversation-turn">
+                          <div className="turn-question">
+                            <span className="turn-label">You:</span>
+                            <span className="turn-text">{entry.query}</span>
+                          </div>
+                          <div className="turn-answer">
+                            {entry.result.text && (
+                              <div className="markdown">
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                  {entry.result.text}
+                                </ReactMarkdown>
+                              </div>
+                            )}
+                            {getDisplayImages(entry.result).length > 0 && (
+                              <div className="images">
+                                {getDisplayImages(entry.result).map((image, i) => {
+                                  const key = `${entry.id}-${image.href}-${i}`;
+                                  const message = imageActionMessage?.key === key ? imageActionMessage.text : null;
+                                  return (
+                                    <figure className="image-card" key={key}>
+                                      <a
+                                        className="image-preview"
+                                        href={image.href}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        title={image.title}
+                                      >
+                                        <img src={image.src} alt="" />
+                                      </a>
+                                      <figcaption>
+                                        <span title={image.path ?? image.fileName}>
+                                          {message ?? image.fileName}
+                                        </span>
+                                        <span className="image-actions">
+                                          {Boolean(image.path && window.__TAURI_INTERNALS__) && (
+                                            <button
+                                              type="button"
+                                              onClick={() => handleRevealImage(image, key)}
+                                              title="Show in Finder/Explorer"
+                                            >
+                                              <FolderOpen size={13} aria-hidden="true" />
+                                              <span>Show</span>
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={() => handleDownloadImage(image, key)}
+                                            title="Save a copy to Downloads"
+                                          >
+                                            <Download size={13} aria-hidden="true" />
+                                            <span>Download</span>
+                                          </button>
+                                        </span>
+                                      </figcaption>
+                                    </figure>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            {entry.result.sources && entry.result.sources.length > 0 && (
+                              <div className="sources">
+                                {entry.result.sources.map((source) => (
+                                  <a href={source.url} key={source.url} target="_blank" rel="noreferrer">
+                                    {source.title}
+                                  </a>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          {index < threadEntries.length - 1 && <div className="turn-divider" />}
+                        </div>
+                      ))}
+                    </div>
                     <div className="result-actions">
                       <button type="button" className="chip" onClick={startFollowUp}>
                         <CornerDownRight size={14} aria-hidden="true" />
                         <span>Follow up</span>
                       </button>
-                      {latestEntry.result.text && (
+                      {threadEntries[threadEntries.length - 1]?.result.text && (
                         <button
                           type="button"
-                          className={`chip ${copiedEntryId === latestEntry.id ? "is-confirmed" : ""}`}
-                          onClick={() => copyResult(latestEntry)}
+                          className={`chip ${copiedEntryId === threadEntries[threadEntries.length - 1]?.id ? "is-confirmed" : ""}`}
+                          onClick={() => copyResult(threadEntries[threadEntries.length - 1])}
                           aria-label="Copy answer"
                         >
-                          {copiedEntryId === latestEntry.id ? (
+                          {copiedEntryId === threadEntries[threadEntries.length - 1]?.id ? (
                             <>
                               <Check size={14} aria-hidden="true" />
                               <span>Copied</span>
@@ -1650,7 +1796,7 @@ export default function App() {
                       )}
                     </div>
                   </article>
-                ) : null}
+                )}
 
                 {entries.length > 1 && !isLoading && (
                   <div className="history">
